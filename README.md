@@ -1,6 +1,8 @@
 # Car Equalizer Test
 
-A small native Android test app for car-style landscape screens. It uses a plain Java `Activity`, Android SDK views, five equalizer bands, preset cycling, reset, and a custom EQ curve preview.
+A small native Android test app for car-style landscape screens. It uses a plain Java `Activity`, Android SDK views, and a real `android.media.audiofx.Equalizer` initialized against audio session `0` / the global output mix.
+
+The app detects the device's actual EQ band count, center frequencies, and gain range at runtime. Slider changes call `equalizer.setBandLevel()`. If the platform refuses to initialize the global equalizer, the screen shows a clear error and disables EQ controls.
 
 ## Local build commands
 
