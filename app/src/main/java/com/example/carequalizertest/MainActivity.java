@@ -71,6 +71,10 @@ public class MainActivity extends Activity {
             }
             equalizerReady = true;
         } catch (Throwable error) {
+            if (equalizer != null) {
+                equalizer.release();
+                equalizer = null;
+            }
             equalizerReady = false;
             bandLabels = new String[]{"Band 1", "Band 2", "Band 3", "Band 4", "Band 5"};
             minBandLevel = -1200;
