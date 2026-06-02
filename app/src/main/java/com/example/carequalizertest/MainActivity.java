@@ -1,6 +1,7 @@
 package com.example.carequalizertest;
 
 import android.app.Activity;
+import android.app.Dialog;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.LinearGradient;
@@ -14,40 +15,67 @@ import android.view.Gravity;
 import android.view.View;
 import android.widget.Button;
 import android.widget.LinearLayout;
+import android.widget.ScrollView;
 import android.widget.SeekBar;
 import android.widget.TextView;
+import android.content.SharedPreferences;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.io.BufferedReader;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.util.ArrayList;
 import java.util.Locale;
 
 public class MainActivity extends Activity {
+    private static final String PRESETS_URL = "https://eqapp-admin.vercel.app/api/presets";
+    private static final String PREFS_NAME = "car_eq_prefs";
+    private static final String KEY_PRESETS_JSON = "presets_json";
+    private static final String KEY_SELECTED_PRESET_ID = "selected_preset_id";
+
     private Equalizer equalizer;
     private EqualizerCurveView curveView;
-    private LinearLayout sliders;
     private TextView presetText;
     private TextView statusText;
-    private TextView rangeText;
+    private TextView syncText;
     private TextView[] valueLabels = new TextView[0];
     private VerticalSeekBar[] seekBars = new VerticalSeekBar[0];
     private String[] bandLabels = new String[0];
+    private int[] bandCenterHz = new int[0];
     private short minBandLevel;
     private short maxBandLevel;
-    private int presetIndex;
     private boolean equalizerReady;
+    private SharedPreferences prefs;
+    private ArrayList<EqPreset> presets = new ArrayList<>();
+    private String selectedPresetId;
+    private Dialog presetDialog;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
+        prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        selectedPresetId = prefs.getString(KEY_SELECTED_PRESET_ID, null);
+
         getWindow().setStatusBarColor(Color.rgb(8, 11, 15));
         getWindow().setNavigationBarColor(Color.rgb(8, 11, 15));
 
         setupEqualizer();
+        loadCachedPresets();
         buildUi();
+        applyLastSelectedPreset();
         refreshLabels();
     }
 
     @Override
     protected void onDestroy() {
+        if (presetDialog != null) {
+            presetDialog.dismiss();
+        }
         if (equalizer != null) {
             equalizer.release();
             equalizer = null;
@@ -66,8 +94,11 @@ public class MainActivity extends Activity {
 
             short bandCount = equalizer.getNumberOfBands();
             bandLabels = new String[bandCount];
+            bandCenterHz = new int[bandCount];
             for (short band = 0; band < bandCount; band++) {
-                bandLabels[band] = formatFrequency(equalizer.getCenterFreq(band));
+                int centerHz = equalizer.getCenterFreq(band) / 1000;
+                bandCenterHz[band] = centerHz;
+                bandLabels[band] = formatFrequency(centerHz);
             }
             equalizerReady = true;
         } catch (Throwable error) {
@@ -77,9 +108,9 @@ public class MainActivity extends Activity {
             }
             equalizerReady = false;
             bandLabels = new String[]{"Band 1", "Band 2", "Band 3", "Band 4", "Band 5"};
+            bandCenterHz = new int[]{60, 230, 910, 4000, 14000};
             minBandLevel = -1200;
             maxBandLevel = 1200;
-            statusText = null;
         }
     }
 
@@ -109,36 +140,46 @@ public class MainActivity extends Activity {
         presetText.setTextColor(Color.rgb(153, 204, 255));
         presetText.setTextSize(18);
         presetText.setGravity(Gravity.CENTER);
-        header.addView(presetText, new LinearLayout.LayoutParams(dp(180), dp(48)));
+        header.addView(presetText, new LinearLayout.LayoutParams(dp(200), dp(48)));
 
-        Button resetButton = makeButton("Reset");
-        resetButton.setEnabled(equalizerReady);
-        resetButton.setOnClickListener(v -> applyPreset(0));
-        header.addView(resetButton, new LinearLayout.LayoutParams(dp(120), dp(48)));
+        Button presetsButton = makeButton("Presets");
+        presetsButton.setOnClickListener(v -> showPresetDialog());
+        header.addView(presetsButton, new LinearLayout.LayoutParams(dp(130), dp(48)));
 
-        Button presetButton = makeButton("Preset");
-        presetButton.setEnabled(equalizerReady);
-        presetButton.setOnClickListener(v -> applyPreset((presetIndex + 1) % 4));
-        LinearLayout.LayoutParams presetParams = new LinearLayout.LayoutParams(dp(130), dp(48));
-        presetParams.leftMargin = dp(12);
-        header.addView(presetButton, presetParams);
+        Button syncButton = makeButton("Sync Presets");
+        syncButton.setOnClickListener(v -> syncPresets());
+        LinearLayout.LayoutParams syncParams = new LinearLayout.LayoutParams(dp(170), dp(48));
+        syncParams.leftMargin = dp(12);
+        header.addView(syncButton, syncParams);
 
         root.addView(header, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 dp(54)
         ));
 
+        LinearLayout statusRow = new LinearLayout(this);
+        statusRow.setOrientation(LinearLayout.HORIZONTAL);
+        statusRow.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout.LayoutParams statusRowParams = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                dp(42)
+        );
+        statusRowParams.topMargin = dp(12);
+
         statusText = makeStatusText();
         statusText.setText(equalizerReady
                 ? "Equalizer initialized on audio session 0 / global output mix"
                 : "ERROR: Equalizer could not initialize on audio session 0 / global output mix");
         statusText.setTextColor(equalizerReady ? Color.rgb(164, 232, 191) : Color.rgb(255, 157, 157));
-        LinearLayout.LayoutParams statusParams = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                dp(42)
-        );
-        statusParams.topMargin = dp(12);
-        root.addView(statusText, statusParams);
+        statusRow.addView(statusText, new LinearLayout.LayoutParams(0, dp(42), 1));
+
+        syncText = makeStatusText();
+        syncText.setText(presets.isEmpty() ? "No cached admin presets" : presets.size() + " cached presets");
+        syncText.setTextColor(Color.rgb(215, 224, 232));
+        LinearLayout.LayoutParams syncTextParams = new LinearLayout.LayoutParams(dp(250), dp(42));
+        syncTextParams.leftMargin = dp(12);
+        statusRow.addView(syncText, syncTextParams);
+        root.addView(statusRow, statusRowParams);
 
         LinearLayout content = new LinearLayout(this);
         content.setOrientation(LinearLayout.HORIZONTAL);
@@ -166,10 +207,7 @@ public class MainActivity extends Activity {
         info.setOrientation(LinearLayout.HORIZONTAL);
         info.setGravity(Gravity.CENTER);
         info.setPadding(0, dp(12), 0, 0);
-
-        String bandText = String.format(Locale.US, "Bands %d", bandLabels.length);
-        rangeText = makeChip(bandText);
-        info.addView(rangeText, chipParams());
+        info.addView(makeChip(String.format(Locale.US, "Bands %d", bandLabels.length)), chipParams());
         info.addView(makeChip("Session 0"), chipParams());
         info.addView(makeChip(equalizerReady ? "Effect On" : "Effect Off"), chipParams());
         info.addView(makeChip(formatDb(minBandLevel) + " to " + formatDb(maxBandLevel)), chipParams());
@@ -178,7 +216,7 @@ public class MainActivity extends Activity {
                 dp(58)
         ));
 
-        sliders = new LinearLayout(this);
+        LinearLayout sliders = new LinearLayout(this);
         sliders.setOrientation(LinearLayout.HORIZONTAL);
         sliders.setGravity(Gravity.CENTER);
         sliders.setPadding(dp(16), dp(8), dp(16), dp(8));
@@ -196,12 +234,6 @@ public class MainActivity extends Activity {
 
         root.addView(content, contentParams);
         setContentView(root);
-
-        if (equalizerReady) {
-            applyPreset(2);
-        } else {
-            presetText.setText("Unavailable");
-        }
     }
 
     private LinearLayout makeBandControl(int index) {
@@ -229,8 +261,8 @@ public class MainActivity extends Activity {
                 if (!equalizerReady) {
                     return;
                 }
-                short level = progressToLevel(progress);
-                equalizer.setBandLevel((short) index, level);
+                equalizer.setBandLevel((short) index, progressToLevel(progress));
+                presetText.setText(selectedPresetName());
                 refreshLabels();
             }
 
@@ -256,6 +288,237 @@ public class MainActivity extends Activity {
         ));
 
         return column;
+    }
+
+    private void syncPresets() {
+        syncText.setText("Syncing...");
+        syncText.setTextColor(Color.rgb(153, 204, 255));
+        new Thread(() -> {
+            try {
+                String json = fetchText(PRESETS_URL);
+                ArrayList<EqPreset> parsedPresets = parsePresets(json);
+                prefs.edit().putString(KEY_PRESETS_JSON, json).apply();
+                runOnUiThread(() -> {
+                    presets = parsedPresets;
+                    syncText.setText(presets.size() + " synced presets");
+                    syncText.setTextColor(Color.rgb(164, 232, 191));
+                    if (presetDialog != null && presetDialog.isShowing()) {
+                        showPresetDialog();
+                    }
+                    applyLastSelectedPreset();
+                });
+            } catch (Exception error) {
+                runOnUiThread(() -> {
+                    syncText.setText("Sync failed; using cache");
+                    syncText.setTextColor(Color.rgb(255, 157, 157));
+                });
+            }
+        }).start();
+    }
+
+    private String fetchText(String urlText) throws Exception {
+        HttpURLConnection connection = (HttpURLConnection) new URL(urlText).openConnection();
+        connection.setConnectTimeout(8000);
+        connection.setReadTimeout(8000);
+        connection.setRequestMethod("GET");
+        int status = connection.getResponseCode();
+        InputStream stream = status >= 200 && status < 300
+                ? connection.getInputStream()
+                : connection.getErrorStream();
+        BufferedReader reader = new BufferedReader(new InputStreamReader(stream));
+        StringBuilder result = new StringBuilder();
+        String line;
+        while ((line = reader.readLine()) != null) {
+            result.append(line);
+        }
+        reader.close();
+        connection.disconnect();
+        if (status < 200 || status >= 300) {
+            throw new IllegalStateException("Preset API returned HTTP " + status);
+        }
+        return result.toString();
+    }
+
+    private void showPresetDialog() {
+        if (presetDialog != null) {
+            presetDialog.dismiss();
+        }
+
+        Dialog dialog = new Dialog(this);
+        LinearLayout panel = new LinearLayout(this);
+        panel.setOrientation(LinearLayout.VERTICAL);
+        panel.setPadding(dp(22), dp(18), dp(22), dp(18));
+        panel.setBackground(new RoundedBackground(Color.rgb(13, 18, 24), dp(8)));
+
+        TextView title = new TextView(this);
+        title.setText("Presets");
+        title.setTextColor(Color.WHITE);
+        title.setTextSize(22);
+        title.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+        panel.addView(title, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                dp(42)
+        ));
+
+        ScrollView scroll = new ScrollView(this);
+        LinearLayout list = new LinearLayout(this);
+        list.setOrientation(LinearLayout.VERTICAL);
+
+        if (presets.isEmpty()) {
+            TextView empty = makeDialogText("No cached presets. Tap Sync Presets.");
+            list.addView(empty, new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    dp(52)
+            ));
+        } else {
+            for (EqPreset preset : presets) {
+                Button button = makeButton(preset.name);
+                button.setGravity(Gravity.CENTER_VERTICAL);
+                button.setOnClickListener(v -> applyPreset(preset));
+                LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT,
+                        dp(52)
+                );
+                params.topMargin = dp(8);
+                list.addView(button, params);
+            }
+        }
+
+        scroll.addView(list);
+        panel.addView(scroll, new LinearLayout.LayoutParams(
+                dp(420),
+                dp(280)
+        ));
+
+        Button close = makeButton("Close");
+        close.setOnClickListener(v -> dialog.dismiss());
+        LinearLayout.LayoutParams closeParams = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                dp(48)
+        );
+        closeParams.topMargin = dp(14);
+        panel.addView(close, closeParams);
+
+        dialog.setContentView(panel);
+        presetDialog = dialog;
+        dialog.show();
+    }
+
+    private void loadCachedPresets() {
+        String json = prefs.getString(KEY_PRESETS_JSON, null);
+        if (json == null || json.trim().isEmpty()) {
+            return;
+        }
+        try {
+            presets = parsePresets(json);
+        } catch (Exception ignored) {
+            presets = new ArrayList<>();
+        }
+    }
+
+    private ArrayList<EqPreset> parsePresets(String json) throws Exception {
+        ArrayList<EqPreset> result = new ArrayList<>();
+        JSONArray presetArray = new JSONObject(json).optJSONArray("presets");
+        if (presetArray == null) {
+            return result;
+        }
+        for (int i = 0; i < presetArray.length(); i++) {
+            JSONObject item = presetArray.optJSONObject(i);
+            if (item == null) {
+                continue;
+            }
+            JSONObject config = item.optJSONObject("config");
+            JSONArray bands = config == null ? null : config.optJSONArray("targetBands");
+            if (bands == null) {
+                continue;
+            }
+
+            EqPreset preset = new EqPreset();
+            preset.id = item.optString("id", "preset-" + i);
+            preset.name = item.optString("name", "Preset " + (i + 1));
+            for (int bandIndex = 0; bandIndex < bands.length(); bandIndex++) {
+                JSONObject band = bands.optJSONObject(bandIndex);
+                if (band == null || !band.has("hz") || !band.has("gainDb")) {
+                    continue;
+                }
+                preset.bands.add(new JsonBand(band.optDouble("hz"), band.optDouble("gainDb")));
+            }
+            if (!preset.bands.isEmpty()) {
+                result.add(preset);
+            }
+        }
+        return result;
+    }
+
+    private void applyLastSelectedPreset() {
+        if (!equalizerReady || presets.isEmpty()) {
+            presetText.setText(selectedPresetName());
+            return;
+        }
+        EqPreset selected = findPresetById(selectedPresetId);
+        if (selected != null) {
+            applyPreset(selected);
+        } else {
+            presetText.setText("Manual");
+        }
+    }
+
+    private void applyPreset(EqPreset preset) {
+        if (!equalizerReady) {
+            return;
+        }
+        int bandCount = bandLabels.length;
+        double[] sums = new double[bandCount];
+        int[] counts = new int[bandCount];
+
+        for (JsonBand jsonBand : preset.bands) {
+            int androidBand = nearestBand(jsonBand.hz);
+            sums[androidBand] += jsonBand.gainDb;
+            counts[androidBand]++;
+        }
+
+        for (short band = 0; band < bandCount; band++) {
+            if (counts[band] == 0) {
+                continue;
+            }
+            double averageGainDb = sums[band] / counts[band];
+            equalizer.setBandLevel(band, clampLevel((int) Math.round(averageGainDb * 100.0)));
+        }
+
+        selectedPresetId = preset.id;
+        prefs.edit().putString(KEY_SELECTED_PRESET_ID, selectedPresetId).apply();
+        presetText.setText(preset.name);
+        refreshLabels();
+    }
+
+    private int nearestBand(double hz) {
+        int nearest = 0;
+        double nearestDistance = Double.MAX_VALUE;
+        for (int i = 0; i < bandCenterHz.length; i++) {
+            double distance = Math.abs(hz - bandCenterHz[i]);
+            if (distance < nearestDistance) {
+                nearest = i;
+                nearestDistance = distance;
+            }
+        }
+        return nearest;
+    }
+
+    private EqPreset findPresetById(String id) {
+        if (id == null) {
+            return null;
+        }
+        for (EqPreset preset : presets) {
+            if (id.equals(preset.id)) {
+                return preset;
+            }
+        }
+        return null;
+    }
+
+    private String selectedPresetName() {
+        EqPreset selected = findPresetById(selectedPresetId);
+        return selected == null ? "Manual" : selected.name;
     }
 
     private Button makeButton(String text) {
@@ -287,31 +550,20 @@ public class MainActivity extends Activity {
         return chip;
     }
 
+    private TextView makeDialogText(String text) {
+        TextView view = new TextView(this);
+        view.setText(text);
+        view.setTextColor(Color.rgb(215, 224, 232));
+        view.setTextSize(16);
+        view.setGravity(Gravity.CENTER_VERTICAL);
+        return view;
+    }
+
     private LinearLayout.LayoutParams chipParams() {
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0, dp(42), 1);
         params.leftMargin = dp(6);
         params.rightMargin = dp(6);
         return params;
-    }
-
-    private void applyPreset(int index) {
-        if (!equalizerReady) {
-            return;
-        }
-        presetIndex = index;
-        String[] names = {"Flat", "Vocal", "Road", "Bass"};
-        float[][] presets = {
-                {0f, 0f, 0f, 0f, 0f},
-                {-0.20f, 0.10f, 0.40f, 0.20f, -0.10f},
-                {0.30f, 0.10f, -0.10f, 0.20f, 0.40f},
-                {0.55f, 0.35f, 0f, -0.10f, 0.20f}
-        };
-        for (short band = 0; band < bandLabels.length; band++) {
-            float shape = presets[index][Math.min(band, presets[index].length - 1)];
-            equalizer.setBandLevel(band, scaledLevel(shape));
-        }
-        presetText.setText(names[index]);
-        refreshLabels();
     }
 
     private void refreshLabels() {
@@ -334,13 +586,6 @@ public class MainActivity extends Activity {
         return equalizer.getBandLevel((short) index);
     }
 
-    private short scaledLevel(float normalized) {
-        float target = normalized >= 0
-                ? normalized * maxBandLevel
-                : -normalized * minBandLevel;
-        return clampLevel(Math.round(target));
-    }
-
     private short progressToLevel(int progress) {
         return clampLevel(minBandLevel + progress);
     }
@@ -353,12 +598,11 @@ public class MainActivity extends Activity {
         return (short) Math.max(minBandLevel, Math.min(maxBandLevel, level));
     }
 
-    private String formatFrequency(int milliHertz) {
-        float hz = milliHertz / 1000f;
-        if (hz >= 1000f) {
+    private String formatFrequency(int hz) {
+        if (hz >= 1000) {
             return String.format(Locale.US, "%.1f kHz", hz / 1000f);
         }
-        return String.format(Locale.US, "%.0f Hz", hz);
+        return String.format(Locale.US, "%d Hz", hz);
     }
 
     private String formatDb(int milliBel) {
@@ -367,6 +611,22 @@ public class MainActivity extends Activity {
 
     private int dp(int value) {
         return Math.round(value * getResources().getDisplayMetrics().density);
+    }
+
+    private static class EqPreset {
+        String id;
+        String name;
+        ArrayList<JsonBand> bands = new ArrayList<>();
+    }
+
+    private static class JsonBand {
+        final double hz;
+        final double gainDb;
+
+        JsonBand(double hz, double gainDb) {
+            this.hz = hz;
+            this.gainDb = gainDb;
+        }
     }
 
     private static class EqualizerCurveView extends View {
@@ -421,7 +681,7 @@ public class MainActivity extends Activity {
                 canvas.drawLine(x, chart.top, x, chart.bottom, gridPaint);
             }
 
-            if (bands.length > 0) {
+            if (bands.length > 0 && maxLevel != minLevel) {
                 curvePath.reset();
                 fillPath.reset();
                 for (int i = 0; i < bands.length; i++) {
