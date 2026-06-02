@@ -4,10 +4,10 @@ A small native Android test app for car-style landscape screens. It uses a plain
 
 The app detects the device's actual EQ band count, center frequencies, and gain range at runtime. Slider changes call `equalizer.setBandLevel()`. If the platform refuses to initialize the global equalizer, the screen shows a clear error and disables EQ controls.
 
-The `Sync Presets` button fetches active presets from:
+The `Sync` button inside the Presets popup fetches active presets from:
 
 ```text
-https://eqapp-admin.vercel.app/api/presets
+https://eq-admin-neon.vercel.app/api/presets
 ```
 
 The app caches the API response locally for offline use, maps each JSON `hz` value to the nearest detected Android EQ band, averages gains when multiple JSON bands map to one Android band, converts `gainDb` to Android millibels, clamps to the device range, and reapplies the last selected preset on restart.
